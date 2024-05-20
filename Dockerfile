@@ -16,8 +16,8 @@ ENV GOARCH=arm64
 
 
 RUN go mod download
-RUN go vet -v
 RUN go generate
+RUN go vet -v
 
 RUN CGO_ENABLED=0 go build -o /go/bin/studious-octo-succotash
 
