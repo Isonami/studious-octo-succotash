@@ -11,15 +11,12 @@ COPY . .
 COPY --from=frontend build ./frontend/
 
 ENV SKIP_NPM=1
-ENV GOOS=linux
-ENV GOARCH=arm64
-
 
 RUN go mod download
 RUN go generate
 RUN go vet -v
 
-RUN CGO_ENABLED=0 go build -o /go/bin/studious-octo-succotash
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /go/bin/studious-octo-succotash
 
 FROM --platform=arm64 ubuntu
 
