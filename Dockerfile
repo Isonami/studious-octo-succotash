@@ -8,7 +8,7 @@ FROM golang as builder
 
 WORKDIR /go/src/app
 COPY . .
-COPY --from=frontend build ./frontend/
+COPY --from=frontend build ./frontend/build
 
 ENV SKIP_NPM=1
 
