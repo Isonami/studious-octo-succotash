@@ -10,8 +10,9 @@ import {styled} from '@mui/material/styles';
 import DownloadIcon from '@mui/icons-material/Download';
 import SyncIcon from '@mui/icons-material/Sync';
 import IconButton from "@mui/material/IconButton";
+import DeleteIcon from '@mui/icons-material/Delete';
 import {useSnackbar} from 'notistack';
-import {Dir, getDirs, syncDir} from "./Api";
+import {Dir, getDirs, syncDir, removeDir} from "./Api";
 
 export type DirsListProps = {
     syncListSize: number;
@@ -30,6 +31,16 @@ export default function DirsList(props: DirsListProps) {
         if (!result.ok) {
             enqueueSnackbar(result.error);
         }
+    };
+
+    const handleRemove = async (path: string) => {
+        const result = await removeDir(path)
+        if (!result.ok) {
+            enqueueSnackbar(result.error);
+        }
+
+        const dirs = await handleGetDirs();
+        setDirs(dirs);
     };
 
     const handleGetDirs = useCallback(async () => {
@@ -66,12 +77,18 @@ export default function DirsList(props: DirsListProps) {
                             <TableCell>{row.path}</TableCell>
                             <TableCell>{row.synced ? "yes" : "no"}</TableCell>
                             <TableCell align="right">{row.synced ?
-                                <IconButton aria-label="resync" color="default" onClick={() => handleSync(row.path)}>
-                                    <SyncIcon/>
-                                </IconButton> :
+                                <div>
+                                    <IconButton aria-label="resync" color="default" onClick={() => handleSync(row.path)}>
+                                        <SyncIcon/>
+                                    </IconButton>
+                                    <IconButton aria-label="remove" color="error" onClick={() => handleRemove(row.path)}>
+                                        <DeleteIcon/>
+                                    </IconButton>
+                                </div> :
                                 <IconButton aria-label="sync" color="success" onClick={() => handleSync(row.path)}>
                                     <DownloadIcon/>
-                                </IconButton>}</TableCell>
+                                </IconButton>}
+                            </TableCell>
                         </DirRow>
                     ))}
                 </TableBody>

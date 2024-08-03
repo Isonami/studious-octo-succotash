@@ -91,8 +91,24 @@ export async function getSyncs(): Promise<SyncsResult> {
 export async function syncDir(path: string): Promise<BaseResult> {
     const url = "/api/sync";
     try {
+        const response = await axios.post<BaseResponse>(url, {path: path}, {validateStatus: () => true})
+        return isError(response) ? {
+            ok: false,
+            error: formatError(response),
+        } : {
+            ok: true,
+        }
+    } catch (error: any) {
+        return {
+            ok: false,
+            error: error.toString(),
+        }
+    }
+}
 
-
+export async function removeDir(path: string): Promise<BaseResult> {
+    const url = "/api/remove";
+    try {
         const response = await axios.post<BaseResponse>(url, {path: path}, {validateStatus: () => true})
         return isError(response) ? {
             ok: false,

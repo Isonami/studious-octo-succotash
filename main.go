@@ -12,7 +12,6 @@ import (
 	"github.com/heetch/confita/backend/flags"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
-	"github.com/puzpuzpuz/xsync/v3"
 	"io/fs"
 	"log"
 	"log/slog"
@@ -24,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	s "sync"
 	"syscall"
 	"time"
 )
@@ -77,11 +77,20 @@ type SyncResult struct {
 	TimeLeft   string `json:"time_left"`
 }
 
-type SyncRequest struct {
+type PathRequest struct {
 	Path string `json:"path"`
 }
 
+type RemoveRequest PathRequest
+
+type SyncRequest PathRequest
+
 type CancelSyncRequest SyncRequest
+
+type syncStorage struct {
+	Data map[string]*Sync
+	s.Mutex
+}
 
 func buildLocalTree(config Config) (map[string]*Dir, error) {
 	pathMap := map[string]*Dir{}
@@ -193,9 +202,11 @@ func buildRemoteTree(logger *slog.Logger, ctx context.Context, config Config, lo
 	return pathMap, nil
 }
 
-func startSync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *xsync.MapOf[string, *Sync], currentSync *Sync) {
+func startSync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *syncStorage, currentSync *Sync) {
 	defer func() {
-		runningSyncs.Delete(currentSync.Path)
+		runningSyncs.Lock()
+		defer runningSyncs.Unlock()
+		delete(runningSyncs.Data, currentSync.Path)
 	}()
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -286,7 +297,7 @@ func startSync(logger *slog.Logger, ctx context.Context, config Config, runningS
 	}
 }
 
-func sync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *xsync.MapOf[string, *Sync], path string) bool {
+func sync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *syncStorage, path string) bool {
 	ctx, cancel := context.WithCancel(ctx)
 
 	newSync := &Sync{
@@ -297,13 +308,36 @@ func sync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs 
 		Cancel:   cancel,
 	}
 
-	if _, ok := runningSyncs.LoadOrStore(path, newSync); ok {
-		return false
+	runningSyncs.Lock()
+	defer runningSyncs.Unlock()
+
+	for _, value := range runningSyncs.Data {
+		if value.Path == path || strings.HasPrefix(value.Path, path) || strings.HasPrefix(path, value.Path) {
+			return false
+		}
 	}
+	runningSyncs.Data[path] = newSync
 
 	go startSync(logger, ctx, config, runningSyncs, newSync)
 
 	return true
+}
+
+func remove(config Config, runningSyncs *syncStorage, path string) (bool, error) {
+	runningSyncs.Lock()
+	defer runningSyncs.Unlock()
+
+	for _, value := range runningSyncs.Data {
+		if value.Path == path || strings.HasPrefix(value.Path, path) || strings.HasPrefix(path, value.Path) {
+			return false, nil
+		}
+	}
+	err := os.RemoveAll(filepath.Join(config.DataPath, path))
+	if err != nil {
+		return false, fmt.Errorf("remove all: %w", err)
+	}
+
+	return true, nil
 }
 
 func ListDirs(logger *slog.Logger, ctx context.Context, config Config) echo.HandlerFunc {
@@ -337,14 +371,16 @@ func ListDirs(logger *slog.Logger, ctx context.Context, config Config) echo.Hand
 	}
 }
 
-func ListSyncs(runningSyncs *xsync.MapOf[string, *Sync]) echo.HandlerFunc {
+func ListSyncs(runningSyncs *syncStorage) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		result := Result[SyncResult]{
 			Error:   "",
 			Results: make([]SyncResult, 0),
 		}
 
-		runningSyncs.Range(func(key string, value *Sync) bool {
+		runningSyncs.Lock()
+		defer runningSyncs.Unlock()
+		for _, value := range runningSyncs.Data {
 			result.Results = append(result.Results, SyncResult{
 				Path:       value.Path,
 				Progress:   value.Progress,
@@ -352,20 +388,25 @@ func ListSyncs(runningSyncs *xsync.MapOf[string, *Sync]) echo.HandlerFunc {
 				Downloaded: value.Downloaded,
 				TimeLeft:   value.TimeLeft,
 			})
-			return true
-		})
+		}
 
 		return c.JSON(http.StatusOK, result)
 	}
 }
 
-func StartSync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *xsync.MapOf[string, *Sync]) echo.HandlerFunc {
+func StartSync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *syncStorage) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		request := &SyncRequest{}
 
 		err := c.Bind(request)
 		if err != nil {
 			return fmt.Errorf("load request: %w", err)
+		}
+
+		if remotePath, err := buildRemoteTree(logger, ctx, config, map[string]*Dir{}); err != nil {
+			return fmt.Errorf("list remote: %w", err)
+		} else if _, ok := remotePath[request.Path]; !ok {
+			return c.JSON(http.StatusBadRequest, Result[string]{Error: "invalid path"})
 		}
 
 		if sync(logger, ctx, config, runningSyncs, request.Path) {
@@ -375,7 +416,7 @@ func StartSync(logger *slog.Logger, ctx context.Context, config Config, runningS
 	}
 }
 
-func CancelSync(runningSyncs *xsync.MapOf[string, *Sync]) echo.HandlerFunc {
+func CancelSync(runningSyncs *syncStorage) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		request := &CancelSyncRequest{}
 
@@ -384,10 +425,37 @@ func CancelSync(runningSyncs *xsync.MapOf[string, *Sync]) echo.HandlerFunc {
 			return fmt.Errorf("load request: %w", err)
 		}
 
-		if currentSync, ok := runningSyncs.Load(request.Path); ok {
+		runningSyncs.Lock()
+		defer runningSyncs.Unlock()
+		if currentSync, ok := runningSyncs.Data[request.Path]; ok {
 			currentSync.Cancel()
 		}
 		return c.JSON(http.StatusOK, Result[string]{})
+	}
+}
+
+func Remove(config Config, runningSyncs *syncStorage) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		request := &RemoveRequest{}
+
+		err := c.Bind(request)
+		if err != nil {
+			return fmt.Errorf("load request: %w", err)
+		}
+
+		if remotePath, err := buildLocalTree(config); err != nil {
+			return fmt.Errorf("list local: %w", err)
+		} else if _, ok := remotePath[request.Path]; !ok {
+			return c.JSON(http.StatusBadRequest, Result[string]{Error: "invalid path"})
+		}
+
+		if ok, err := remove(config, runningSyncs, request.Path); err != nil {
+			return fmt.Errorf("remove path: %w", err)
+		} else if ok {
+			return c.JSON(http.StatusOK, Result[string]{})
+		}
+
+		return c.JSON(http.StatusConflict, Result[string]{Error: "sync in progress"})
 	}
 }
 
@@ -451,7 +519,9 @@ func main() {
 		log.Fatalln("failed to load config", err)
 	}
 
-	runningSyncs := xsync.NewMapOf[string, *Sync]()
+	runningSyncs := &syncStorage{
+		Data: map[string]*Sync{},
+	}
 
 	var level slog.Level
 	err = level.UnmarshalText([]byte(config.LogLevel))
@@ -498,8 +568,9 @@ func main() {
 	e.GET("/api/syncs", ListSyncs(runningSyncs))
 	e.POST("/api/sync", StartSync(logger, quit, config, runningSyncs))
 	e.POST("/api/cancel", CancelSync(runningSyncs))
+	e.POST("/api/remove", Remove(config, runningSyncs))
 
-	s := http.Server{
+	srv := http.Server{
 		Addr:    fmt.Sprintf("%s:%d", config.Host, config.Port),
 		Handler: e,
 	}
@@ -510,7 +581,7 @@ func main() {
 			os.Exit(1)
 		}
 		cancel() // in case server returns before ctrl+c
-	}(&s)
+	}(&srv)
 
 	// Wait until interrupt signal to start shutdown
 	<-quit.Done()
@@ -519,7 +590,7 @@ func main() {
 	ctx, cancelGC := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelGC()
 
-	if err := s.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(ctx); err != nil {
 		logger.Error("server shutdown", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
