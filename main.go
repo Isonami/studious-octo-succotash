@@ -390,6 +390,10 @@ func ListSyncs(runningSyncs *syncStorage) echo.HandlerFunc {
 			})
 		}
 
+		sort.Slice(result.Results, func(i, j int) bool {
+			return result.Results[i].Path > result.Results[j].Path
+		})
+
 		return c.JSON(http.StatusOK, result)
 	}
 }
