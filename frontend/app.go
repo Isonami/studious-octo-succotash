@@ -64,6 +64,7 @@ func NewHandler() *app.Handler {
 	RegisterRoutes()
 	return &app.Handler{
 		Name:            "Syncer",
+		Icon:            app.Icon{Default: "/web/favicon.png"},
 		ShortName:       "Syncer",
 		Title:           "Syncer",
 		Description:     "Remote sync dashboard.",
