@@ -1,16 +1,7 @@
-FROM node as frontend
-
-COPY frontend .
-RUN npm install
-RUN npm run build
-
 FROM golang as builder
 
 WORKDIR /go/src/app
 COPY . .
-COPY --from=frontend build ./frontend/build
-
-ENV SKIP_NPM=1
 
 RUN go mod download
 RUN go generate
