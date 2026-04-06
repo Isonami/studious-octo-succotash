@@ -63,8 +63,11 @@ func RegisterRoutes() {
 func NewHandler() *app.Handler {
 	RegisterRoutes()
 	return &app.Handler{
-		Name:            "Syncer",
-		Icon:            app.Icon{Default: "/web/favicon.png"},
+		Name: "Syncer",
+		Icon: app.Icon{
+			Default: "/web/favicon.png",
+			SVG:     "/web/favicon.svg",
+		},
 		ShortName:       "Syncer",
 		Title:           "Syncer",
 		Description:     "Remote sync dashboard.",
@@ -223,7 +226,7 @@ func (d *dashboard) renderDirsTable() app.UI {
 				app.Td().Body(
 					app.Span().Class(syncStateClass(current.Synced)).Text(syncStateText(current.Synced)),
 				),
-				app.Td().Class("actions-cell").Body(renderDirActions(d, current)),
+				app.Td().Body(app.Div().Class("actions-cell").Body(renderDirActions(d, current))),
 			))
 		}
 	}
