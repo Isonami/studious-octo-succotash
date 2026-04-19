@@ -29,16 +29,23 @@ import (
 )
 
 type Config struct {
-	Host        string `config:"host"`
-	Port        uint32 `config:"port"`
-	LogLevel    string `config:"log_level"`
-	DataPath    string `config:"data_path"`
-	RemoteHost  string `config:"remote_host"`
-	RemotePort  uint32 `config:"remote_port"`
-	RemoteUser  string `config:"remote_user"`
-	RsyncSSHKey string `config:"rsync_ssh_key"`
-	LsSSHKey    string `config:"ls_ssh_key"`
-	KnownHosts  string `config:"known_hosts"`
+	Host              string `config:"host"`
+	Port              uint32 `config:"port"`
+	LogLevel          string `config:"log_level"`
+	DataPath          string `config:"data_path"`
+	RemoteHost        string `config:"remote_host"`
+	RemotePort        uint32 `config:"remote_port"`
+	RemoteUser        string `config:"remote_user"`
+	RsyncSSHKey       string `config:"rsync_ssh_key"`
+	LsSSHKey          string `config:"ls_ssh_key"`
+	KnownHosts        string `config:"known_hosts"`
+	OIDCIssuerURL     string `config:"oidc_issuer_url"`
+	OIDCClientID      string `config:"oidc_client_id"`
+	OIDCClientSecret  string `config:"oidc_client_secret"`
+	OIDCRedirectURL   string `config:"oidc_redirect_url"`
+	OIDCScopes        string `config:"oidc_scopes"`
+	OIDCAllowedEmails string `config:"oidc_allowed_emails"`
+	SessionSecret     string `config:"session_secret"`
 }
 
 type Dir struct {
@@ -463,6 +470,23 @@ func Remove(config Config, runningSyncs *syncStorage) echo.HandlerFunc {
 	}
 }
 
+func staticCacheControlMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			path := c.Request().URL.Path
+			if !strings.HasPrefix(path, "/api/") && !strings.HasPrefix(path, "/auth/") {
+				switch {
+				case path == "/" || strings.HasSuffix(path, ".html") || path == "/app-worker.js":
+					c.Response().Header().Set(echo.HeaderCacheControl, "no-cache")
+				default:
+					c.Response().Header().Set(echo.HeaderCacheControl, "public, max-age=300")
+				}
+			}
+			return next(c)
+		}
+	}
+}
+
 func customHTTPErrorHandler(err error, c echo.Context) {
 	code := http.StatusInternalServerError
 	var he *echo.HTTPError
@@ -481,14 +505,14 @@ func testConfig(config Config) error {
 	if config.DataPath == "" {
 		errs = append(errs, errors.New("data path must be specified"))
 	}
+	if config.RemoteHost == "" {
+		errs = append(errs, errors.New("remote host must be specified"))
+	}
 	if config.RemoteUser == "" {
 		errs = append(errs, errors.New("remote user must be specified"))
 	}
 	if config.RemotePort == 0 {
 		errs = append(errs, errors.New("remote port must be specified"))
-	}
-	if config.RemoteUser == "" {
-		errs = append(errs, errors.New("remote user must be specified"))
 	}
 	if config.RsyncSSHKey == "" {
 		errs = append(errs, errors.New("rsync ssh key file must be specified"))
@@ -497,7 +521,24 @@ func testConfig(config Config) error {
 		errs = append(errs, errors.New("ls ssh key file must be specified"))
 	}
 	if config.KnownHosts == "" {
-		errs = append(errs, errors.New("known host file  must be specified"))
+		errs = append(errs, errors.New("known host file must be specified"))
+	}
+	if oidcEnabled(config) {
+		if config.OIDCIssuerURL == "" {
+			errs = append(errs, errors.New("oidc issuer url must be specified when oidc is enabled"))
+		}
+		if config.OIDCClientID == "" {
+			errs = append(errs, errors.New("oidc client id must be specified when oidc is enabled"))
+		}
+		if config.OIDCClientSecret == "" {
+			errs = append(errs, errors.New("oidc client secret must be specified when oidc is enabled"))
+		}
+		if config.OIDCRedirectURL == "" {
+			errs = append(errs, errors.New("oidc redirect url must be specified when oidc is enabled"))
+		}
+		if config.SessionSecret == "" {
+			errs = append(errs, errors.New("session secret must be specified when oidc is enabled"))
+		}
 	}
 
 	return errors.Join(errs...)
@@ -566,8 +607,21 @@ func main() {
 		},
 	}))
 	e.HTTPErrorHandler = customHTTPErrorHandler
+	e.Use(staticCacheControlMiddleware())
+
+	var auth *OIDCAuth
+	if oidcEnabled(config) {
+		auth, err = NewOIDCAuth(context.Background(), logger, config)
+		if err != nil {
+			logger.Error("oidc init failed", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		auth.RegisterRoutes(e)
+		e.Use(auth.Middleware())
+	}
 
 	e.StaticFS("/", echo.MustSubFS(content, "frontend/build"))
+	e.GET("/api/user", UserHandler(auth))
 	e.GET("/api/dirs", ListDirs(logger, quit, config))
 	e.GET("/api/syncs", ListSyncs(runningSyncs))
 	e.POST("/api/sync", StartSync(logger, quit, config, runningSyncs))

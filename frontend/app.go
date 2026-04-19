@@ -3,8 +3,10 @@ package frontend
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +43,17 @@ type syncsResponse struct {
 	Results []syncItem `json:"results"`
 }
 
+type user struct {
+	Subject string `json:"subject"`
+	Email   string `json:"email"`
+	Name    string `json:"name"`
+}
+
+type userResponse struct {
+	baseResponse
+	Results []user `json:"results"`
+}
+
 type pathRequest struct {
 	Path string `json:"path"`
 }
@@ -48,11 +61,14 @@ type pathRequest struct {
 type dashboard struct {
 	app.Compo
 
-	dirs   []dir
-	syncs  []syncItem
-	errors []string
-	active bool
+	dirs        []dir
+	syncs       []syncItem
+	errors      []string
+	currentUser user
+	active      bool
 }
+
+var errAuthenticationRequired = errors.New("authentication required")
 
 func RegisterRoutes() {
 	registerOnce.Do(func() {
@@ -75,10 +91,6 @@ func NewHandler() *app.Handler {
 		ThemeColor:      "#0f172a",
 		LoadingLabel:    "Loading Syncer {progress}%",
 		Styles:          []string{"/web/main.css"},
-		CacheableResources: []string{
-			"/web/main.css",
-			"/web/app.wasm",
-		},
 	}
 }
 
@@ -101,9 +113,12 @@ func (d *dashboard) Render() app.UI {
 					app.H1().Class("brand").Text("Syncer"),
 					app.P().Class("subtitle").Text("Remote directories and active syncs."),
 				),
-				app.Div().Class("status-chip").Body(
-					app.Span().Class("status-label").Text("Active syncs"),
-					app.Strong().Text(fmt.Sprintf("%d", len(d.syncs))),
+				app.Div().Class("inline-actions").Body(
+					app.Div().Class("status-chip").Body(
+						app.Span().Class("status-label").Text("Active syncs"),
+						app.Strong().Text(fmt.Sprintf("%d", len(d.syncs))),
+					),
+					d.renderUserChip(),
 				),
 			),
 		),
@@ -126,6 +141,20 @@ func (d *dashboard) Render() app.UI {
 				),
 			),
 		),
+	)
+}
+
+func (d *dashboard) renderUserChip() app.UI {
+	label := strings.TrimSpace(d.currentUser.Name)
+	if label == "" {
+		label = strings.TrimSpace(d.currentUser.Email)
+	}
+	if label == "" {
+		return app.Div()
+	}
+
+	return app.Div().Class("status-chip").Body(
+		app.Span().Class("status-label").Text(label),
 	)
 }
 
@@ -278,7 +307,7 @@ func (d *dashboard) handleSync(ctx app.Context, path string) {
 	ctx.Async(func() {
 		if err := postPath("/api/sync", path); err != nil {
 			ctx.Dispatch(func(ctx app.Context) {
-				d.pushError(err.Error())
+				d.handleError(err)
 			})
 			return
 		}
@@ -293,7 +322,7 @@ func (d *dashboard) handleRemove(ctx app.Context, path string) {
 	ctx.Async(func() {
 		if err := postPath("/api/remove", path); err != nil {
 			ctx.Dispatch(func(ctx app.Context) {
-				d.pushError(err.Error())
+				d.handleError(err)
 			})
 			return
 		}
@@ -308,7 +337,7 @@ func (d *dashboard) handleCancel(ctx app.Context, path string) {
 	ctx.Async(func() {
 		if err := postPath("/api/cancel", path); err != nil {
 			ctx.Dispatch(func(ctx app.Context) {
-				d.pushError(err.Error())
+				d.handleError(err)
 			})
 			return
 		}
@@ -320,8 +349,22 @@ func (d *dashboard) handleCancel(ctx app.Context, path string) {
 }
 
 func (d *dashboard) refreshAll(ctx app.Context) {
+	d.refreshUser(ctx)
 	d.refreshDirs(ctx)
 	d.refreshSyncs(ctx, false)
+}
+
+func (d *dashboard) refreshUser(ctx app.Context) {
+	ctx.Async(func() {
+		result, err := fetchUser()
+		ctx.Dispatch(func(ctx app.Context) {
+			if err != nil {
+				d.handleError(err)
+				return
+			}
+			d.currentUser = result
+		})
+	})
 }
 
 func (d *dashboard) refreshDirs(ctx app.Context) {
@@ -329,7 +372,7 @@ func (d *dashboard) refreshDirs(ctx app.Context) {
 		result, err := fetchDirs()
 		ctx.Dispatch(func(ctx app.Context) {
 			if err != nil {
-				d.pushError(err.Error())
+				d.handleError(err)
 				return
 			}
 			d.dirs = result
@@ -342,7 +385,7 @@ func (d *dashboard) refreshSyncs(ctx app.Context, refreshDirsOnCountChange bool)
 		result, err := fetchSyncs()
 		ctx.Dispatch(func(ctx app.Context) {
 			if err != nil {
-				d.pushError(err.Error())
+				d.handleError(err)
 				return
 			}
 
@@ -370,6 +413,14 @@ func (d *dashboard) schedulePoll(ctx app.Context) {
 	})
 }
 
+func (d *dashboard) handleError(err error) {
+	if errors.Is(err, errAuthenticationRequired) {
+		redirectToLogin()
+		return
+	}
+	d.pushError(err.Error())
+}
+
 func (d *dashboard) pushError(message string) {
 	message = strings.TrimSpace(message)
 	if message == "" {
@@ -392,6 +443,17 @@ func (d *dashboard) dismissError(index int) {
 	}
 
 	d.errors = append(d.errors[:index], d.errors[index+1:]...)
+}
+
+func fetchUser() (user, error) {
+	var response userResponse
+	if err := getJSON("/api/user", &response); err != nil {
+		return user{}, err
+	}
+	if len(response.Results) == 0 {
+		return user{}, nil
+	}
+	return response.Results[0], nil
 }
 
 func fetchDirs() ([]dir, error) {
@@ -463,6 +525,8 @@ func decodeResponse(resp *http.Response, target any) error {
 			payload = value.baseResponse
 		case *syncsResponse:
 			payload = value.baseResponse
+		case *userResponse:
+			payload = value.baseResponse
 		}
 	}
 
@@ -470,6 +534,9 @@ func decodeResponse(resp *http.Response, target any) error {
 		message := strings.TrimSpace(payload.Error)
 		if message == "" {
 			message = resp.Status
+		}
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("%w: %s", errAuthenticationRequired, message)
 		}
 		return fmt.Errorf("%d: %s", resp.StatusCode, message)
 	}
@@ -479,6 +546,19 @@ func decodeResponse(resp *http.Response, target any) error {
 	}
 
 	return nil
+}
+
+func redirectToLogin() {
+	returnTo := "/"
+	if location := app.Window().Get("location"); location.Truthy() {
+		path := location.Get("pathname").String()
+		search := location.Get("search").String()
+		hash := location.Get("hash").String()
+		if path != "" {
+			returnTo = path + search + hash
+		}
+	}
+	app.Window().Get("location").Set("href", "/auth/login?return_to="+url.QueryEscape(returnTo))
 }
 
 func syncStateClass(synced bool) string {
