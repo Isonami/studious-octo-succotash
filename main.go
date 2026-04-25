@@ -475,12 +475,10 @@ func staticCacheControlMiddleware() echo.MiddlewareFunc {
 		return func(c echo.Context) error {
 			path := c.Request().URL.Path
 			if !strings.HasPrefix(path, "/api/") && !strings.HasPrefix(path, "/auth/") {
-				switch {
-				case path == "/" || strings.HasSuffix(path, ".html") || path == "/app-worker.js":
-					c.Response().Header().Set(echo.HeaderCacheControl, "no-cache")
-				default:
-					c.Response().Header().Set(echo.HeaderCacheControl, "public, max-age=300")
-				}
+				// The embedded frontend does not use content-hashed filenames, so make
+				// browsers revalidate static files on each request. This lets the ETag
+				// middleware drive 304 responses and ensures new builds are picked up.
+				c.Response().Header().Set(echo.HeaderCacheControl, "public, no-cache")
 			}
 			return next(c)
 		}
@@ -607,7 +605,14 @@ func main() {
 		},
 	}))
 	e.HTTPErrorHandler = customHTTPErrorHandler
+	frontendFiles, err := newFrontendFS(content, "frontend/build", frontendBuildUnix)
+	if err != nil {
+		logger.Error("frontend fs init failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
 	e.Use(staticCacheControlMiddleware())
+	e.Use(frontendETagMiddleware(frontendFiles))
 	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
 		Level: 5,
 		Skipper: func(c echo.Context) bool {
@@ -626,7 +631,7 @@ func main() {
 		e.Use(auth.Middleware())
 	}
 
-	e.StaticFS("/", echo.MustSubFS(content, "frontend/build"))
+	e.StaticFS("/", frontendFiles)
 	e.GET("/api/user", UserHandler(auth))
 	e.GET("/api/dirs", ListDirs(logger, quit, config))
 	e.GET("/api/syncs", ListSyncs(runningSyncs))

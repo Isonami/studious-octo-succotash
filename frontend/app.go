@@ -65,6 +65,7 @@ type dashboard struct {
 	syncs       []syncItem
 	errors      []string
 	currentUser user
+	dirFilter   string
 	active      bool
 }
 
@@ -137,6 +138,9 @@ func (d *dashboard) Render() app.UI {
 						app.H2().Text("Remote dirs"),
 						app.P().Text("Start, re-run, or remove synced directories."),
 					),
+					app.Div().Class("filter-row").Body(
+						d.renderDirFilter(),
+					),
 					d.renderDirsTable(),
 				),
 			),
@@ -180,6 +184,18 @@ func (d *dashboard) renderErrors() app.UI {
 	}
 
 	return app.Div().Class("notice-stack").Body(items...)
+}
+
+func (d *dashboard) renderDirFilter() app.UI {
+	return app.Input().
+		Class("filter-input").
+		Type("search").
+		Placeholder("Filter remote dirs...").
+		Value(d.dirFilter).
+		OnInput(func(ctx app.Context, e app.Event) {
+			d.dirFilter = e.Get("target").Get("value").String()
+			ctx.Update()
+		})
 }
 
 func (d *dashboard) renderSyncsTable() app.UI {
@@ -237,13 +253,18 @@ func (d *dashboard) renderSyncsTable() app.UI {
 }
 
 func (d *dashboard) renderDirsTable() app.UI {
-	rows := make([]app.UI, 0, len(d.dirs)+1)
-	if len(d.dirs) == 0 {
+	dirs := d.filteredDirs()
+	rows := make([]app.UI, 0, len(dirs)+1)
+	if len(dirs) == 0 {
+		message := "No remote directories found."
+		if strings.TrimSpace(d.dirFilter) != "" && len(d.dirs) > 0 {
+			message = "No remote directories match this filter."
+		}
 		rows = append(rows, app.Tr().Body(
-			app.Td().ColSpan(3).Class("empty-state").Text("No remote directories found."),
+			app.Td().ColSpan(3).Class("empty-state").Text(message),
 		))
 	} else {
-		for _, dir := range d.dirs {
+		for _, dir := range dirs {
 			current := dir
 			rowClass := "dir-row"
 			if current.Synced {
@@ -272,6 +293,21 @@ func (d *dashboard) renderDirsTable() app.UI {
 			app.TBody().Body(rows...),
 		),
 	)
+}
+
+func (d *dashboard) filteredDirs() []dir {
+	filter := strings.ToLower(strings.TrimSpace(d.dirFilter))
+	if filter == "" {
+		return d.dirs
+	}
+
+	filtered := make([]dir, 0, len(d.dirs))
+	for _, dir := range d.dirs {
+		if strings.Contains(strings.ToLower(dir.Path), filter) {
+			filtered = append(filtered, dir)
+		}
+	}
+	return filtered
 }
 
 func renderDirActions(d *dashboard, current dir) app.UI {

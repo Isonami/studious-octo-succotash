@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	frontend "github.com/isonami/studious-octo-succotash/frontend"
 	"github.com/maxence-charriere/go-app/v10/pkg/app"
@@ -22,7 +24,8 @@ import "embed"
 
 	footer = `
 var content embed.FS
-`
+
+var frontendBuildUnix int64 = `
 )
 
 func main() {
@@ -57,7 +60,7 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	data := "package " + os.Args[1] + header + filepath.Join(os.Args[2], "build/*") + footer
+	data := "package " + os.Args[1] + header + filepath.Join(os.Args[2], "build/*") + footer + strconv.FormatInt(time.Now().UTC().Unix(), 10) + "\n"
 	if err := os.WriteFile(os.Args[3], []byte(data), 0o644); err != nil {
 		log.Fatalln(err)
 	}
