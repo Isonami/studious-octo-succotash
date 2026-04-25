@@ -87,8 +87,8 @@ func NewHandler() *app.Handler {
 		ShortName:       "Syncer",
 		Title:           "Syncer",
 		Description:     "Remote sync dashboard.",
-		BackgroundColor: "#0f172a",
-		ThemeColor:      "#0f172a",
+		BackgroundColor: "#07090d",
+		ThemeColor:      "#07090d",
 		LoadingLabel:    "Loading Syncer {progress}%",
 		Styles:          []string{"/web/main.css"},
 	}

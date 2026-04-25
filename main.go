@@ -608,6 +608,12 @@ func main() {
 	}))
 	e.HTTPErrorHandler = customHTTPErrorHandler
 	e.Use(staticCacheControlMiddleware())
+	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
+		Level: 5,
+		Skipper: func(c echo.Context) bool {
+			return strings.HasPrefix(c.Request().URL.Path, "/api/")
+		},
+	}))
 
 	var auth *OIDCAuth
 	if oidcEnabled(config) {
