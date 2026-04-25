@@ -272,11 +272,14 @@ func (d *dashboard) renderDirsTable() app.UI {
 			}
 
 			rows = append(rows, app.Tr().Class(rowClass).Body(
-				app.Td().Class("path-cell").Text(current.Path),
+				app.Td().Class("path-cell dir-path-cell").Body(
+					app.Div().Text(current.Path),
+					app.Div().Class("mobile-dir-actions").Body(renderDirActions(d, current)),
+				),
 				app.Td().Body(
 					app.Span().Class(syncStateClass(current.Synced)).Text(syncStateText(current.Synced)),
 				),
-				app.Td().Body(app.Div().Class("actions-cell").Body(renderDirActions(d, current))),
+				app.Td().Class("desktop-dir-actions").Body(app.Div().Class("actions-cell").Body(renderDirActions(d, current))),
 			))
 		}
 	}

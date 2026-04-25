@@ -218,6 +218,10 @@ body {
   word-break: break-all;
 }
 
+.mobile-dir-actions {
+  display: none;
+}
+
 .dir-row.synced {
   background: rgba(34, 197, 94, 0.06);
 }
@@ -368,5 +372,27 @@ body {
   .actions-cell {
     justify-content: flex-start;
     flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 650px) {
+  .desktop-dir-actions,
+  .data-table th:last-child {
+    display: none;
+  }
+
+  .dir-path-cell {
+    min-width: 220px;
+  }
+
+  .mobile-dir-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .mobile-dir-actions .inline-actions {
+    justify-content: flex-start;
   }
 }
