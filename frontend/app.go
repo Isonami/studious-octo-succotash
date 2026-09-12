@@ -229,7 +229,7 @@ func (d *dashboard) renderSyncsTable() app.UI {
 						Text("Cancel").
 						OnClick(func(ctx app.Context, e app.Event) {
 							d.handleCancel(ctx, current.Path)
-						}),
+						}, app.EventScope(current.Path)),
 				),
 			))
 		}
@@ -322,14 +322,14 @@ func renderDirActions(d *dashboard, current dir) app.UI {
 				Text("Resync").
 				OnClick(func(ctx app.Context, e app.Event) {
 					d.handleSync(ctx, current.Path)
-				}),
+				}, app.EventScope(current.Path)),
 			app.Button().
 				Class("action-button danger").
 				Type("button").
 				Text("Remove").
 				OnClick(func(ctx app.Context, e app.Event) {
 					d.handleRemove(ctx, current.Path)
-				}),
+				}, app.EventScope(current.Path)),
 		)
 	}
 
@@ -339,7 +339,7 @@ func renderDirActions(d *dashboard, current dir) app.UI {
 		Text("Sync").
 		OnClick(func(ctx app.Context, e app.Event) {
 			d.handleSync(ctx, current.Path)
-		})
+		}, app.EventScope(current.Path))
 }
 
 func (d *dashboard) handleSync(ctx app.Context, path string) {
