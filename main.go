@@ -267,34 +267,16 @@ func startSync(logger *slog.Logger, ctx context.Context, config Config, runningS
 		scanner.Split(bufio.ScanWords)
 		for scanner.Scan() {
 			text := scanner.Text()
-			if strings.HasSuffix(text, "%") {
-				v, err := strconv.Atoi(strings.TrimSuffix(text, "%"))
-				if err != nil {
-					logger.Error("failed parse string", slog.String("value", text), slog.String("error", err.Error()))
-				} else {
-					currentSync.Progress = uint(v)
-				}
-				continue
-			}
-			if strings.HasSuffix(text, "/s") {
-				v, err := units.FromHumanSize(strings.TrimSuffix(text, "/s"))
-				if err != nil {
-					logger.Error("failed parse string", slog.String("value", text), slog.String("error", err.Error()))
-				} else {
-					currentSync.Speed = uint(v)
-				}
-				continue
-			}
-			if strings.Contains(text, ":") {
-				currentSync.TimeLeft = text
-				continue
-			}
-			v, err := strconv.Atoi(strings.ReplaceAll(text, ",", ""))
+
+			runningSyncs.Lock()
+			err := parseRsyncProgressToken(currentSync, text)
+			runningSyncs.Unlock()
 			if err != nil {
 				logger.Error("failed parse string", slog.String("value", text), slog.String("error", err.Error()))
-			} else {
-				currentSync.Downloaded = uint(v)
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			logger.Error("read rsync stdout", slog.String("error", err.Error()))
 		}
 	}()
 
@@ -302,6 +284,73 @@ func startSync(logger *slog.Logger, ctx context.Context, config Config, runningS
 	if err != nil {
 		logger.Error("wait command", slog.String("error", err.Error()))
 	}
+}
+
+// parseRsyncProgressToken applies one field from rsync's --info=progress2
+// output. Status fields such as "(xfr#0," and "to-chk=24/25)" are expected
+// output and are intentionally ignored.
+func parseRsyncProgressToken(currentSync *Sync, text string) error {
+	if strings.HasSuffix(text, "%") {
+		v, err := strconv.ParseUint(strings.TrimSuffix(text, "%"), 10, 64)
+		if err != nil {
+			return err
+		}
+		currentSync.Progress = uint(v)
+		return nil
+	}
+
+	if strings.HasSuffix(text, "/s") {
+		v, err := units.FromHumanSize(strings.TrimSuffix(text, "/s"))
+		if err != nil {
+			return err
+		}
+		currentSync.Speed = uint(v)
+		return nil
+	}
+
+	if isRsyncDuration(text) {
+		currentSync.TimeLeft = text
+		return nil
+	}
+
+	if isRsyncByteCount(text) {
+		v, err := strconv.ParseUint(strings.ReplaceAll(text, ",", ""), 10, 64)
+		if err != nil {
+			return err
+		}
+		currentSync.Downloaded = uint(v)
+	}
+
+	return nil
+}
+
+func isRsyncDuration(text string) bool {
+	parts := strings.Split(text, ":")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || !isDigitsAndCommas(part, false) {
+			return false
+		}
+	}
+	return true
+}
+
+func isRsyncByteCount(text string) bool {
+	return text != "" && isDigitsAndCommas(text, true)
+}
+
+func isDigitsAndCommas(text string, allowCommas bool) bool {
+	for _, char := range text {
+		if char >= '0' && char <= '9' {
+			continue
+		}
+		if !allowCommas || char != ',' {
+			return false
+		}
+	}
+	return true
 }
 
 func sync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *syncStorage, path string) bool {
