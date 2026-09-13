@@ -12,6 +12,7 @@ import (
 	"github.com/heetch/confita/backend/flags"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"io"
 	"io/fs"
 	"log"
 	"log/slog"
@@ -95,11 +96,18 @@ type SyncRequest PathRequest
 type CancelSyncRequest SyncRequest
 
 type syncStorage struct {
-	Data map[string]*Sync
+	Data     map[string]*Sync
+	Removing map[string]struct{}
+	Workers  s.WaitGroup
 	s.Mutex
 }
 
-func buildLocalTree(config Config) (map[string]*Dir, error) {
+const (
+	remoteCommandTimeout = 45 * time.Second
+	maxScannerTokenSize  = 1024 * 1024
+)
+
+func buildLocalTree(ctx context.Context, config Config) (map[string]*Dir, error) {
 	pathMap := map[string]*Dir{}
 
 	dir, err := filepath.Abs(config.DataPath)
@@ -108,6 +116,9 @@ func buildLocalTree(config Config) (map[string]*Dir, error) {
 	}
 
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil {
 			return fmt.Errorf("walk dir item: %w", err)
 		}
@@ -142,7 +153,11 @@ func buildLocalTree(config Config) (map[string]*Dir, error) {
 func buildRemoteTree(logger *slog.Logger, ctx context.Context, config Config, localPathMap map[string]*Dir) (map[string]*Dir, error) {
 	pathMap := map[string]*Dir{}
 
-	cmd := exec.CommandContext(ctx, "ssh", "-T", "-p", fmt.Sprintf("%d", config.RemotePort), "-o", fmt.Sprintf("UserKnownHostsFile=%s", config.KnownHosts), "-o", "StrictHostKeyChecking=yes", "-o", "PasswordAuthentication=no", "-i", config.LsSSHKey, fmt.Sprintf("%s@%s", config.RemoteUser, config.RemoteHost))
+	cmd := exec.CommandContext(ctx, "ssh", "-T", "-p", fmt.Sprintf("%d", config.RemotePort), "-o", fmt.Sprintf("UserKnownHostsFile=%s", config.KnownHosts), "-o", "StrictHostKeyChecking=yes", "-o", "PasswordAuthentication=no", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2", "-i", config.LsSSHKey, fmt.Sprintf("%s@%s", config.RemoteUser, config.RemoteHost))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return signalProcessGroup(cmd, syscall.SIGKILL)
+	}
 
 	logger.Debug("ls cmd", slog.Any("args", cmd.Args))
 
@@ -153,22 +168,22 @@ func buildRemoteTree(logger *slog.Logger, ctx context.Context, config Config, lo
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, fmt.Errorf("get stdout pipe: %w", err)
+		return nil, fmt.Errorf("get stderr pipe: %w", err)
 	}
 
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			logger.Info(scanner.Text())
-		}
-	}()
-
 	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), maxScannerTokenSize)
 	err = cmd.Start()
 
 	if err != nil {
 		return nil, fmt.Errorf("start command: %w", err)
 	}
+
+	stderrDone := make(chan struct{})
+	go func() {
+		scanAndLogPipe(logger, "ssh stderr", stderr)
+		close(stderrDone)
+	}()
 
 	for scanner.Scan() {
 		path := scanner.Text()
@@ -187,9 +202,20 @@ func buildRemoteTree(logger *slog.Logger, ctx context.Context, config Config, lo
 		pathMap[item.Path] = &item
 	}
 
+	scanErr := scanner.Err()
+	if scanErr != nil {
+		// Keep draining after Scanner reaches its token limit so the child cannot
+		// block on a full pipe while Wait waits for it to exit.
+		_, _ = io.Copy(io.Discard, stdout)
+	}
+
+	<-stderrDone
 	err = cmd.Wait()
 	if err != nil {
 		return nil, fmt.Errorf("wait command: %w", err)
+	}
+	if scanErr != nil {
+		return nil, fmt.Errorf("read command stdout: %w", scanErr)
 	}
 
 	var setNotSynced func(*Dir)
@@ -209,80 +235,168 @@ func buildRemoteTree(logger *slog.Logger, ctx context.Context, config Config, lo
 	return pathMap, nil
 }
 
-func startSync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *syncStorage, currentSync *Sync) {
+func startSync(logger *slog.Logger, config Config, runningSyncs *syncStorage, currentSync *Sync) {
+	defer currentSync.Cancel()
 	defer func() {
 		runningSyncs.Lock()
-		defer runningSyncs.Unlock()
 		delete(runningSyncs.Data, currentSync.Path)
+		runningSyncs.Unlock()
 	}()
 
-	ctx, cancel := context.WithCancel(ctx)
-
 	syncPath, _ := filepath.Split(filepath.Join(config.DataPath, currentSync.Path))
-	err := os.MkdirAll(syncPath, 0755)
-	if err != nil {
+	if err := os.MkdirAll(syncPath, 0755); err != nil {
 		logger.Error("create path failed", slog.String("error", err.Error()))
-		cancel()
 		return
 	}
 
-	cmd := exec.CommandContext(ctx, "rsync", "-a", "--info=progress2", "-e", fmt.Sprintf("ssh -i %s -p %d -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o PasswordAuthentication=no", config.RsyncSSHKey, config.RemotePort, config.KnownHosts), fmt.Sprintf("%s@%s:%s", config.RemoteUser, config.RemoteHost, filepath.Join(currentSync.Path)), syncPath)
+	cmd := exec.Command("rsync", "-a", "--info=progress2", "-e", fmt.Sprintf("ssh -i %s -p %d -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o PasswordAuthentication=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2", config.RsyncSSHKey, config.RemotePort, config.KnownHosts), fmt.Sprintf("%s@%s:%s", config.RemoteUser, config.RemoteHost, filepath.Join(currentSync.Path)), syncPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	logger.Debug("rsync cmd", slog.Any("args", cmd.Args))
 
-	go func() {
-		<-currentSync.Context.Done()
+	cmd.Stdout = &rsyncProgressWriter{
+		logger:       logger,
+		runningSyncs: runningSyncs,
+		currentSync:  currentSync,
+	}
+	cmd.Stderr = processLogWriter{logger: logger, source: "rsync stderr"}
 
-		if cmd.Process.Pid != -1 {
-			err := cmd.Process.Signal(syscall.SIGTERM)
-			if err != nil {
-				logger.Error("terminate err", slog.String("error", err.Error()))
-			}
-			time.Sleep(time.Second * 5)
-			cancel()
-		}
-	}()
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		logger.Error("stderr pipe", slog.String("error", err.Error()))
+	if err := cmd.Start(); err != nil {
+		logger.Error("start rsync", slog.String("error", err.Error()))
 		return
 	}
 
+	processDone := make(chan struct{})
+	waitResult := make(chan error, 1)
 	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			logger.Info(scanner.Text())
-		}
+		err := cmd.Wait()
+		close(processDone)
+		waitResult <- err
 	}()
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		logger.Error("get stdout pipe", slog.String("error", err.Error()))
-		return
-	}
-
+	cancellationWatcherDone := make(chan struct{})
 	go func() {
-		scanner := bufio.NewScanner(stdout)
-		scanner.Split(bufio.ScanWords)
-		for scanner.Scan() {
-			text := scanner.Text()
-
-			runningSyncs.Lock()
-			err := parseRsyncProgressToken(currentSync, text)
-			runningSyncs.Unlock()
-			if err != nil {
-				logger.Error("failed parse string", slog.String("value", text), slog.String("error", err.Error()))
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			logger.Error("read rsync stdout", slog.String("error", err.Error()))
-		}
+		terminateProcessGroupOnCancel(logger, currentSync.Context, cmd, processDone)
+		close(cancellationWatcherDone)
 	}()
 
-	err = cmd.Run()
-	if err != nil {
+	err := <-waitResult
+	<-cancellationWatcherDone
+	if err != nil && currentSync.Context.Err() == nil {
 		logger.Error("wait command", slog.String("error", err.Error()))
+	}
+}
+
+func terminateProcessGroupOnCancel(logger *slog.Logger, ctx context.Context, cmd *exec.Cmd, processDone <-chan struct{}) {
+	select {
+	case <-processDone:
+		return
+	case <-ctx.Done():
+	}
+
+	// Avoid signaling if Wait completed concurrently with context cancellation.
+	select {
+	case <-processDone:
+		return
+	default:
+	}
+
+	if err := signalProcessGroup(cmd, syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
+		logger.Error("terminate rsync", slog.String("error", err.Error()))
+	}
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-processDone:
+		return
+	case <-timer.C:
+		// Wait only completes after os/exec's pipe-copy goroutines finish. If it
+		// has not completed, kill descendants that may still own those pipes.
+		if err := signalProcessGroup(cmd, syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
+			logger.Error("kill rsync", slog.String("error", err.Error()))
+		}
+	}
+}
+
+// rsyncProgressWriter lets os/exec own and drain its pipes while parsing complete
+// whitespace-delimited progress fields across arbitrary Write boundaries.
+type rsyncProgressWriter struct {
+	logger       *slog.Logger
+	runningSyncs *syncStorage
+	currentSync  *Sync
+	pending      []byte
+	discarding   bool
+}
+
+func (w *rsyncProgressWriter) Write(data []byte) (int, error) {
+	for _, char := range data {
+		if char <= ' ' {
+			w.applyPending()
+			w.discarding = false
+			continue
+		}
+		if w.discarding {
+			continue
+		}
+		if len(w.pending) >= maxScannerTokenSize {
+			w.pending = w.pending[:0]
+			w.discarding = true
+			w.logger.Error("rsync progress token too large")
+			continue
+		}
+		w.pending = append(w.pending, char)
+	}
+	return len(data), nil
+}
+
+func (w *rsyncProgressWriter) applyPending() {
+	if len(w.pending) == 0 {
+		return
+	}
+	text := string(w.pending)
+	w.pending = w.pending[:0]
+
+	w.runningSyncs.Lock()
+	err := parseRsyncProgressToken(w.currentSync, text)
+	w.runningSyncs.Unlock()
+	if err != nil {
+		w.logger.Error("failed parse string", slog.String("value", text), slog.String("error", err.Error()))
+	}
+}
+
+type processLogWriter struct {
+	logger *slog.Logger
+	source string
+}
+
+func (w processLogWriter) Write(data []byte) (int, error) {
+	if message := strings.TrimSpace(string(data)); message != "" {
+		w.logger.Info(message, slog.String("source", w.source))
+	}
+	return len(data), nil
+}
+
+func signalProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
+	if cmd.Process == nil {
+		return os.ErrProcessDone
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, signal); errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	} else {
+		return err
+	}
+}
+
+func scanAndLogPipe(logger *slog.Logger, source string, reader io.Reader) {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), maxScannerTokenSize)
+	for scanner.Scan() {
+		logger.Info(scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		logger.Error("read process pipe", slog.String("source", source), slog.String("error", err.Error()))
+		_, _ = io.Copy(io.Discard, reader)
 	}
 }
 
@@ -354,6 +468,9 @@ func isDigitsAndCommas(text string, allowCommas bool) bool {
 }
 
 func sync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *syncStorage, path string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	ctx, cancel := context.WithCancel(ctx)
 
 	newSync := &Sync{
@@ -367,38 +484,91 @@ func sync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs 
 	runningSyncs.Lock()
 	defer runningSyncs.Unlock()
 
-	for _, value := range runningSyncs.Data {
-		if value.Path == path || strings.HasPrefix(value.Path, path) || strings.HasPrefix(path, value.Path) {
-			return false
-		}
+	if runningSyncs.hasConflictLocked(path) {
+		cancel()
+		return false
 	}
 	runningSyncs.Data[path] = newSync
+	runningSyncs.Workers.Add(1)
 
-	go startSync(logger, ctx, config, runningSyncs, newSync)
+	go func() {
+		defer runningSyncs.Workers.Done()
+		startSync(logger, config, runningSyncs, newSync)
+	}()
 
 	return true
 }
 
-func remove(config Config, runningSyncs *syncStorage, path string) (bool, error) {
-	runningSyncs.Lock()
-	defer runningSyncs.Unlock()
-
-	for _, value := range runningSyncs.Data {
-		if value.Path == path || strings.HasPrefix(value.Path, path) || strings.HasPrefix(path, value.Path) {
-			return false, nil
+func (s *syncStorage) hasConflictLocked(path string) bool {
+	for _, value := range s.Data {
+		if pathsOverlap(value.Path, path) {
+			return true
 		}
 	}
-	err := os.RemoveAll(filepath.Join(config.DataPath, path))
-	if err != nil {
+	for removingPath := range s.Removing {
+		if pathsOverlap(removingPath, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathsOverlap(left, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	return isSameOrDescendant(left, right) || isSameOrDescendant(right, left)
+}
+
+func isSameOrDescendant(path, parent string) bool {
+	if path == parent {
+		return true
+	}
+	if parent == string(filepath.Separator) {
+		return strings.HasPrefix(path, parent)
+	}
+	return strings.HasPrefix(path, parent+string(filepath.Separator))
+}
+
+func remove(config Config, runningSyncs *syncStorage, path string) (bool, error) {
+	runningSyncs.Lock()
+	if runningSyncs.hasConflictLocked(path) {
+		runningSyncs.Unlock()
+		return false, nil
+	}
+	if runningSyncs.Removing == nil {
+		runningSyncs.Removing = make(map[string]struct{})
+	}
+	runningSyncs.Removing[path] = struct{}{}
+	runningSyncs.Unlock()
+
+	defer func() {
+		runningSyncs.Lock()
+		delete(runningSyncs.Removing, path)
+		runningSyncs.Unlock()
+	}()
+
+	if err := os.RemoveAll(filepath.Join(config.DataPath, path)); err != nil {
 		return false, fmt.Errorf("remove all: %w", err)
 	}
 
 	return true, nil
 }
 
-func ListDirs(logger *slog.Logger, ctx context.Context, config Config) echo.HandlerFunc {
+func remoteRequestContext(requestContext, shutdownContext context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(requestContext, remoteCommandTimeout)
+	stopShutdownCancel := context.AfterFunc(shutdownContext, cancel)
+	return ctx, func() {
+		stopShutdownCancel()
+		cancel()
+	}
+}
+
+func ListDirs(logger *slog.Logger, shutdownContext context.Context, config Config) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		localPathMap, err := buildLocalTree(config)
+		ctx, cancel := remoteRequestContext(c.Request().Context(), shutdownContext)
+		defer cancel()
+
+		localPathMap, err := buildLocalTree(ctx, config)
 		if err != nil {
 			return fmt.Errorf("list local: %w", err)
 		}
@@ -435,7 +605,6 @@ func ListSyncs(runningSyncs *syncStorage) echo.HandlerFunc {
 		}
 
 		runningSyncs.Lock()
-		defer runningSyncs.Unlock()
 		for _, value := range runningSyncs.Data {
 			result.Results = append(result.Results, SyncResult{
 				Path:       value.Path,
@@ -445,6 +614,7 @@ func ListSyncs(runningSyncs *syncStorage) echo.HandlerFunc {
 				TimeLeft:   value.TimeLeft,
 			})
 		}
+		runningSyncs.Unlock()
 
 		sort.Slice(result.Results, func(i, j int) bool {
 			return result.Results[i].Path > result.Results[j].Path
@@ -454,7 +624,7 @@ func ListSyncs(runningSyncs *syncStorage) echo.HandlerFunc {
 	}
 }
 
-func StartSync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *syncStorage) echo.HandlerFunc {
+func StartSync(logger *slog.Logger, shutdownContext context.Context, config Config, runningSyncs *syncStorage) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		request := &SyncRequest{}
 
@@ -463,13 +633,17 @@ func StartSync(logger *slog.Logger, ctx context.Context, config Config, runningS
 			return fmt.Errorf("load request: %w", err)
 		}
 
-		if remotePath, err := buildRemoteTree(logger, ctx, config, map[string]*Dir{}); err != nil {
+		ctx, cancel := remoteRequestContext(c.Request().Context(), shutdownContext)
+		remotePath, err := buildRemoteTree(logger, ctx, config, map[string]*Dir{})
+		cancel()
+		if err != nil {
 			return fmt.Errorf("list remote: %w", err)
-		} else if _, ok := remotePath[request.Path]; !ok {
+		}
+		if _, ok := remotePath[request.Path]; !ok {
 			return c.JSON(http.StatusBadRequest, Result[string]{Error: "invalid path"})
 		}
 
-		if sync(logger, ctx, config, runningSyncs, request.Path) {
+		if sync(logger, shutdownContext, config, runningSyncs, request.Path) {
 			return c.JSON(http.StatusOK, Result[string]{})
 		}
 		return c.JSON(http.StatusConflict, Result[string]{Error: "sync already started"})
@@ -486,8 +660,9 @@ func CancelSync(runningSyncs *syncStorage) echo.HandlerFunc {
 		}
 
 		runningSyncs.Lock()
-		defer runningSyncs.Unlock()
-		if currentSync, ok := runningSyncs.Data[request.Path]; ok {
+		currentSync := runningSyncs.Data[request.Path]
+		runningSyncs.Unlock()
+		if currentSync != nil {
 			currentSync.Cancel()
 		}
 		return c.JSON(http.StatusOK, Result[string]{})
@@ -503,7 +678,7 @@ func Remove(config Config, runningSyncs *syncStorage) echo.HandlerFunc {
 			return fmt.Errorf("load request: %w", err)
 		}
 
-		if remotePath, err := buildLocalTree(config); err != nil {
+		if remotePath, err := buildLocalTree(c.Request().Context(), config); err != nil {
 			return fmt.Errorf("list local: %w", err)
 		} else if _, ok := remotePath[request.Path]; !ok {
 			return c.JSON(http.StatusBadRequest, Result[string]{Error: "invalid path"})
@@ -612,7 +787,8 @@ func main() {
 	}
 
 	runningSyncs := &syncStorage{
-		Data: map[string]*Sync{},
+		Data:     map[string]*Sync{},
+		Removing: map[string]struct{}{},
 	}
 
 	var level slog.Level
@@ -708,8 +884,13 @@ func main() {
 	ctx, cancelGC := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelGC()
 
-	if err := srv.Shutdown(ctx); err != nil {
-		logger.Error("server shutdown", slog.String("error", err.Error()))
+	shutdownErr := srv.Shutdown(ctx)
+
+	// Shutdown (or its deadline) prevents new handlers from completing a worker
+	// registration because the shared quit context is already cancelled.
+	runningSyncs.Workers.Wait()
+	if shutdownErr != nil {
+		logger.Error("server shutdown", slog.String("error", shutdownErr.Error()))
 		os.Exit(1)
 	}
 }

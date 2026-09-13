@@ -2,6 +2,7 @@ package frontend
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,15 +62,22 @@ type pathRequest struct {
 type dashboard struct {
 	app.Compo
 
-	dirs        []dir
-	syncs       []syncItem
-	errors      []string
-	currentUser user
-	dirFilter   string
-	active      bool
+	dirs                   []dir
+	syncs                  []syncItem
+	errors                 []string
+	currentUser            user
+	dirFilter              string
+	active                 bool
+	requestContext         context.Context
+	cancelRequests         context.CancelFunc
+	syncRefreshInFlight    bool
+	syncRefreshDirsPending bool
 }
 
-var errAuthenticationRequired = errors.New("authentication required")
+var (
+	errAuthenticationRequired = errors.New("authentication required")
+	frontendHTTPClient        = &http.Client{Timeout: 60 * time.Second}
+)
 
 func RegisterRoutes() {
 	registerOnce.Do(func() {
@@ -97,12 +105,18 @@ func NewHandler() *app.Handler {
 
 func (d *dashboard) OnMount(ctx app.Context) {
 	d.active = true
+	d.syncRefreshInFlight = false
+	d.syncRefreshDirsPending = false
+	d.requestContext, d.cancelRequests = context.WithCancel(context.Background())
 	d.refreshAll(ctx)
 	d.schedulePoll(ctx)
 }
 
 func (d *dashboard) OnDismount() {
 	d.active = false
+	if d.cancelRequests != nil {
+		d.cancelRequests()
+	}
 }
 
 func (d *dashboard) Render() app.UI {
@@ -343,8 +357,9 @@ func renderDirActions(d *dashboard, current dir) app.UI {
 }
 
 func (d *dashboard) handleSync(ctx app.Context, path string) {
+	requestContext := d.requestContext
 	ctx.Async(func() {
-		if err := postPath("/api/sync", path); err != nil {
+		if err := postPath(requestContext, "/api/sync", path); err != nil {
 			ctx.Dispatch(func(ctx app.Context) {
 				d.handleError(err)
 			})
@@ -358,8 +373,9 @@ func (d *dashboard) handleSync(ctx app.Context, path string) {
 }
 
 func (d *dashboard) handleRemove(ctx app.Context, path string) {
+	requestContext := d.requestContext
 	ctx.Async(func() {
-		if err := postPath("/api/remove", path); err != nil {
+		if err := postPath(requestContext, "/api/remove", path); err != nil {
 			ctx.Dispatch(func(ctx app.Context) {
 				d.handleError(err)
 			})
@@ -373,8 +389,9 @@ func (d *dashboard) handleRemove(ctx app.Context, path string) {
 }
 
 func (d *dashboard) handleCancel(ctx app.Context, path string) {
+	requestContext := d.requestContext
 	ctx.Async(func() {
-		if err := postPath("/api/cancel", path); err != nil {
+		if err := postPath(requestContext, "/api/cancel", path); err != nil {
 			ctx.Dispatch(func(ctx app.Context) {
 				d.handleError(err)
 			})
@@ -394,8 +411,9 @@ func (d *dashboard) refreshAll(ctx app.Context) {
 }
 
 func (d *dashboard) refreshUser(ctx app.Context) {
+	requestContext := d.requestContext
 	ctx.Async(func() {
-		result, err := fetchUser()
+		result, err := fetchUser(requestContext)
 		ctx.Dispatch(func(ctx app.Context) {
 			if err != nil {
 				d.handleError(err)
@@ -407,8 +425,9 @@ func (d *dashboard) refreshUser(ctx app.Context) {
 }
 
 func (d *dashboard) refreshDirs(ctx app.Context) {
+	requestContext := d.requestContext
 	ctx.Async(func() {
-		result, err := fetchDirs()
+		result, err := fetchDirs(requestContext)
 		ctx.Dispatch(func(ctx app.Context) {
 			if err != nil {
 				d.handleError(err)
@@ -420,9 +439,19 @@ func (d *dashboard) refreshDirs(ctx app.Context) {
 }
 
 func (d *dashboard) refreshSyncs(ctx app.Context, refreshDirsOnCountChange bool) {
+	if d.syncRefreshInFlight {
+		d.syncRefreshDirsPending = d.syncRefreshDirsPending || refreshDirsOnCountChange
+		return
+	}
+	d.syncRefreshInFlight = true
+	requestContext := d.requestContext
+
 	ctx.Async(func() {
-		result, err := fetchSyncs()
+		result, err := fetchSyncs(requestContext)
 		ctx.Dispatch(func(ctx app.Context) {
+			d.syncRefreshInFlight = false
+			refreshDirsOnCountChange = refreshDirsOnCountChange || d.syncRefreshDirsPending
+			d.syncRefreshDirsPending = false
 			if err != nil {
 				d.handleError(err)
 				return
@@ -484,9 +513,9 @@ func (d *dashboard) dismissError(index int) {
 	d.errors = append(d.errors[:index], d.errors[index+1:]...)
 }
 
-func fetchUser() (user, error) {
+func fetchUser(ctx context.Context) (user, error) {
 	var response userResponse
-	if err := getJSON("/api/user", &response); err != nil {
+	if err := getJSON(ctx, "/api/user", &response); err != nil {
 		return user{}, err
 	}
 	if len(response.Results) == 0 {
@@ -495,29 +524,29 @@ func fetchUser() (user, error) {
 	return response.Results[0], nil
 }
 
-func fetchDirs() ([]dir, error) {
+func fetchDirs(ctx context.Context) ([]dir, error) {
 	var response dirsResponse
-	if err := getJSON("/api/dirs", &response); err != nil {
+	if err := getJSON(ctx, "/api/dirs", &response); err != nil {
 		return nil, err
 	}
 	return response.Results, nil
 }
 
-func fetchSyncs() ([]syncItem, error) {
+func fetchSyncs(ctx context.Context) ([]syncItem, error) {
 	var response syncsResponse
-	if err := getJSON("/api/syncs", &response); err != nil {
+	if err := getJSON(ctx, "/api/syncs", &response); err != nil {
 		return nil, err
 	}
 	return response.Results, nil
 }
 
-func getJSON(url string, target any) error {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func getJSON(ctx context.Context, url string, target any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := frontendHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -526,19 +555,19 @@ func getJSON(url string, target any) error {
 	return decodeResponse(resp, target)
 }
 
-func postPath(url, path string) error {
+func postPath(ctx context.Context, url, path string) error {
 	body, err := json.Marshal(pathRequest{Path: path})
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := frontendHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
