@@ -249,7 +249,7 @@ func startSync(logger *slog.Logger, config Config, runningSyncs *syncStorage, cu
 		return
 	}
 
-	cmd := exec.Command("rsync", "-a", "--info=progress2", "-e", fmt.Sprintf("ssh -i %s -p %d -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o PasswordAuthentication=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2", config.RsyncSSHKey, config.RemotePort, config.KnownHosts), fmt.Sprintf("%s@%s:%s", config.RemoteUser, config.RemoteHost, filepath.Join(currentSync.Path)), syncPath)
+	cmd := exec.Command("rsync", "-a", "--info=progress2", "--partial", "-e", fmt.Sprintf("ssh -i %s -p %d -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o PasswordAuthentication=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2", config.RsyncSSHKey, config.RemotePort, config.KnownHosts), fmt.Sprintf("%s@%s:%s", config.RemoteUser, config.RemoteHost, filepath.Join(currentSync.Path)), syncPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	logger.Debug("rsync cmd", slog.Any("args", cmd.Args))
