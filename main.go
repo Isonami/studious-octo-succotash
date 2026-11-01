@@ -30,23 +30,32 @@ import (
 )
 
 type Config struct {
-	Host              string `config:"host"`
-	Port              uint32 `config:"port"`
-	LogLevel          string `config:"log_level"`
-	DataPath          string `config:"data_path"`
-	RemoteHost        string `config:"remote_host"`
-	RemotePort        uint32 `config:"remote_port"`
-	RemoteUser        string `config:"remote_user"`
-	RsyncSSHKey       string `config:"rsync_ssh_key"`
-	LsSSHKey          string `config:"ls_ssh_key"`
-	KnownHosts        string `config:"known_hosts"`
-	OIDCIssuerURL     string `config:"oidc_issuer_url"`
-	OIDCClientID      string `config:"oidc_client_id"`
-	OIDCClientSecret  string `config:"oidc_client_secret"`
-	OIDCRedirectURL   string `config:"oidc_redirect_url"`
-	OIDCScopes        string `config:"oidc_scopes"`
-	OIDCAllowedEmails string `config:"oidc_allowed_emails"`
-	SessionSecret     string `config:"session_secret"`
+	MQTTBroker          string `config:"mqtt_broker"`
+	MQTTTopic           string `config:"mqtt_topic"`
+	MQTTUsername        string `config:"mqtt_username"`
+	MQTTPassword        string `config:"mqtt_password"`
+	RedisURL            string `config:"redis_url"`
+	RedisPrefix         string `config:"redis_prefix"`
+	SyncWorker          string `config:"sync_worker"`
+	KubernetesContainer string `config:"kubernetes_container"`
+	WorkerExecutable    string `config:"worker_executable"`
+	Host                string `config:"host"`
+	Port                uint32 `config:"port"`
+	LogLevel            string `config:"log_level"`
+	DataPath            string `config:"data_path"`
+	RemoteHost          string `config:"remote_host"`
+	RemotePort          uint32 `config:"remote_port"`
+	RemoteUser          string `config:"remote_user"`
+	RsyncSSHKey         string `config:"rsync_ssh_key"`
+	LsSSHKey            string `config:"ls_ssh_key"`
+	KnownHosts          string `config:"known_hosts"`
+	OIDCIssuerURL       string `config:"oidc_issuer_url"`
+	OIDCClientID        string `config:"oidc_client_id"`
+	OIDCClientSecret    string `config:"oidc_client_secret"`
+	OIDCRedirectURL     string `config:"oidc_redirect_url"`
+	OIDCScopes          string `config:"oidc_scopes"`
+	OIDCAllowedEmails   string `config:"oidc_allowed_emails"`
+	SessionSecret       string `config:"session_secret"`
 }
 
 type Dir struct {
@@ -96,9 +105,6 @@ type SyncRequest PathRequest
 type CancelSyncRequest SyncRequest
 
 type syncStorage struct {
-	Data     map[string]*Sync
-	Removing map[string]struct{}
-	Workers  s.WaitGroup
 	s.Mutex
 }
 
@@ -235,18 +241,11 @@ func buildRemoteTree(logger *slog.Logger, ctx context.Context, config Config, lo
 	return pathMap, nil
 }
 
-func startSync(logger *slog.Logger, config Config, runningSyncs *syncStorage, currentSync *Sync) {
-	defer currentSync.Cancel()
-	defer func() {
-		runningSyncs.Lock()
-		delete(runningSyncs.Data, currentSync.Path)
-		runningSyncs.Unlock()
-	}()
+func startSync(logger *slog.Logger, config Config, runningSyncs *syncStorage, currentSync *Sync) error {
 
 	syncPath, _ := filepath.Split(filepath.Join(config.DataPath, currentSync.Path))
 	if err := os.MkdirAll(syncPath, 0755); err != nil {
-		logger.Error("create path failed", slog.String("error", err.Error()))
-		return
+		return fmt.Errorf("create path: %w", err)
 	}
 
 	cmd := exec.Command("rsync", "-a", "--info=progress2", "--partial", "-e", fmt.Sprintf("ssh -i %s -p %d -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o PasswordAuthentication=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2", config.RsyncSSHKey, config.RemotePort, config.KnownHosts), fmt.Sprintf("%s@%s:%s", config.RemoteUser, config.RemoteHost, filepath.Join(currentSync.Path)), syncPath)
@@ -262,8 +261,7 @@ func startSync(logger *slog.Logger, config Config, runningSyncs *syncStorage, cu
 	cmd.Stderr = processLogWriter{logger: logger, source: "rsync stderr"}
 
 	if err := cmd.Start(); err != nil {
-		logger.Error("start rsync", slog.String("error", err.Error()))
-		return
+		return fmt.Errorf("start rsync: %w", err)
 	}
 
 	processDone := make(chan struct{})
@@ -282,9 +280,10 @@ func startSync(logger *slog.Logger, config Config, runningSyncs *syncStorage, cu
 
 	err := <-waitResult
 	<-cancellationWatcherDone
-	if err != nil && currentSync.Context.Err() == nil {
-		logger.Error("wait command", slog.String("error", err.Error()))
+	if currentSync.Context.Err() != nil {
+		return currentSync.Context.Err()
 	}
+	return err
 }
 
 func terminateProcessGroupOnCancel(logger *slog.Logger, ctx context.Context, cmd *exec.Cmd, processDone <-chan struct{}) {
@@ -467,52 +466,6 @@ func isDigitsAndCommas(text string, allowCommas bool) bool {
 	return true
 }
 
-func sync(logger *slog.Logger, ctx context.Context, config Config, runningSyncs *syncStorage, path string) bool {
-	if ctx.Err() != nil {
-		return false
-	}
-	ctx, cancel := context.WithCancel(ctx)
-
-	newSync := &Sync{
-		Path:     path,
-		Progress: 0,
-		Speed:    0,
-		Context:  ctx,
-		Cancel:   cancel,
-	}
-
-	runningSyncs.Lock()
-	defer runningSyncs.Unlock()
-
-	if runningSyncs.hasConflictLocked(path) {
-		cancel()
-		return false
-	}
-	runningSyncs.Data[path] = newSync
-	runningSyncs.Workers.Add(1)
-
-	go func() {
-		defer runningSyncs.Workers.Done()
-		startSync(logger, config, runningSyncs, newSync)
-	}()
-
-	return true
-}
-
-func (s *syncStorage) hasConflictLocked(path string) bool {
-	for _, value := range s.Data {
-		if pathsOverlap(value.Path, path) {
-			return true
-		}
-	}
-	for removingPath := range s.Removing {
-		if pathsOverlap(removingPath, path) {
-			return true
-		}
-	}
-	return false
-}
-
 func pathsOverlap(left, right string) bool {
 	left = filepath.Clean(left)
 	right = filepath.Clean(right)
@@ -527,31 +480,6 @@ func isSameOrDescendant(path, parent string) bool {
 		return strings.HasPrefix(path, parent)
 	}
 	return strings.HasPrefix(path, parent+string(filepath.Separator))
-}
-
-func remove(config Config, runningSyncs *syncStorage, path string) (bool, error) {
-	runningSyncs.Lock()
-	if runningSyncs.hasConflictLocked(path) {
-		runningSyncs.Unlock()
-		return false, nil
-	}
-	if runningSyncs.Removing == nil {
-		runningSyncs.Removing = make(map[string]struct{})
-	}
-	runningSyncs.Removing[path] = struct{}{}
-	runningSyncs.Unlock()
-
-	defer func() {
-		runningSyncs.Lock()
-		delete(runningSyncs.Removing, path)
-		runningSyncs.Unlock()
-	}()
-
-	if err := os.RemoveAll(filepath.Join(config.DataPath, path)); err != nil {
-		return false, fmt.Errorf("remove all: %w", err)
-	}
-
-	return true, nil
 }
 
 func remoteRequestContext(requestContext, shutdownContext context.Context) (context.Context, context.CancelFunc) {
@@ -597,24 +525,18 @@ func ListDirs(logger *slog.Logger, shutdownContext context.Context, config Confi
 	}
 }
 
-func ListSyncs(runningSyncs *syncStorage) echo.HandlerFunc {
+func ListSyncs(runningSyncs *redisSyncStore) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		result := Result[SyncResult]{
 			Error:   "",
 			Results: make([]SyncResult, 0),
 		}
 
-		runningSyncs.Lock()
-		for _, value := range runningSyncs.Data {
-			result.Results = append(result.Results, SyncResult{
-				Path:       value.Path,
-				Progress:   value.Progress,
-				Speed:      value.Speed,
-				Downloaded: value.Downloaded,
-				TimeLeft:   value.TimeLeft,
-			})
+		var err error
+		result.Results, err = runningSyncs.list(c.Request().Context())
+		if err != nil {
+			return fmt.Errorf("list syncs: %w", err)
 		}
-		runningSyncs.Unlock()
 
 		sort.Slice(result.Results, func(i, j int) bool {
 			return result.Results[i].Path > result.Results[j].Path
@@ -624,7 +546,7 @@ func ListSyncs(runningSyncs *syncStorage) echo.HandlerFunc {
 	}
 }
 
-func StartSync(logger *slog.Logger, shutdownContext context.Context, config Config, runningSyncs *syncStorage) echo.HandlerFunc {
+func StartSync(logger *slog.Logger, shutdownContext context.Context, config Config, runningSyncs *redisSyncStore) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		request := &SyncRequest{}
 
@@ -643,14 +565,32 @@ func StartSync(logger *slog.Logger, shutdownContext context.Context, config Conf
 			return c.JSON(http.StatusBadRequest, Result[string]{Error: "invalid path"})
 		}
 
-		if sync(logger, shutdownContext, config, runningSyncs, request.Path) {
+		id, ok, err := runningSyncs.reserve(c.Request().Context(), filepath.Clean(request.Path), "queued")
+		if err != nil {
+			return fmt.Errorf("reserve sync: %w", err)
+		}
+		if ok {
+			if err := launchSyncWorker(c.Request().Context(), config, id); err != nil {
+				// A timed-out Kubernetes response may still have launched a worker.
+				// Atomically fail an unclaimed reservation or request stop if claimed.
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, finishErr := runningSyncs.update(cleanupCtx, id, "launch_failed", err.Error())
+				cleanupCancel()
+				if finishErr != nil {
+					logger.Error("release sync reservation", slog.Any("error", finishErr))
+				}
+				notifier := newMQTTSyncNotifier(config, logger)
+				notifier.Notify("error", id, filepath.Clean(request.Path), "failed", fmt.Errorf("launch sync worker: %w", err))
+				notifier.Close()
+				return fmt.Errorf("launch sync worker: %w", err)
+			}
 			return c.JSON(http.StatusOK, Result[string]{})
 		}
 		return c.JSON(http.StatusConflict, Result[string]{Error: "sync already started"})
 	}
 }
 
-func CancelSync(runningSyncs *syncStorage) echo.HandlerFunc {
+func CancelSync(runningSyncs *redisSyncStore) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		request := &CancelSyncRequest{}
 
@@ -659,17 +599,14 @@ func CancelSync(runningSyncs *syncStorage) echo.HandlerFunc {
 			return fmt.Errorf("load request: %w", err)
 		}
 
-		runningSyncs.Lock()
-		currentSync := runningSyncs.Data[request.Path]
-		runningSyncs.Unlock()
-		if currentSync != nil {
-			currentSync.Cancel()
+		if err := runningSyncs.stop(c.Request().Context(), filepath.Clean(request.Path)); err != nil {
+			return fmt.Errorf("stop sync: %w", err)
 		}
 		return c.JSON(http.StatusOK, Result[string]{})
 	}
 }
 
-func Remove(config Config, runningSyncs *syncStorage) echo.HandlerFunc {
+func Remove(config Config, runningSyncs *redisSyncStore) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		request := &RemoveRequest{}
 
@@ -684,7 +621,7 @@ func Remove(config Config, runningSyncs *syncStorage) echo.HandlerFunc {
 			return c.JSON(http.StatusBadRequest, Result[string]{Error: "invalid path"})
 		}
 
-		if ok, err := remove(config, runningSyncs, request.Path); err != nil {
+		if ok, err := removeWithRedis(c.Request().Context(), config, runningSyncs, filepath.Clean(request.Path)); err != nil {
 			return fmt.Errorf("remove path: %w", err)
 		} else if ok {
 			return c.JSON(http.StatusOK, Result[string]{})
@@ -724,6 +661,9 @@ func customHTTPErrorHandler(err error, c echo.Context) {
 
 func testConfig(config Config) error {
 	var errs []error
+	if err := validateMQTTConfig(config); err != nil {
+		errs = append(errs, err)
+	}
 	if config.DataPath == "" {
 		errs = append(errs, errors.New("data path must be specified"))
 	}
@@ -767,7 +707,7 @@ func testConfig(config Config) error {
 }
 
 func main() {
-	quit, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	quit, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	loader := confita.NewLoader(
@@ -776,19 +716,17 @@ func main() {
 	)
 
 	config := Config{
-		Host:     "",
-		Port:     8080,
-		LogLevel: "Info",
+		Host:        "",
+		Port:        8080,
+		LogLevel:    "Info",
+		RedisURL:    "redis://localhost:6379/0",
+		RedisPrefix: "studious:",
+		MQTTTopic:   "studious/sync",
 	}
 
 	err := loader.Load(context.Background(), &config)
 	if err != nil {
 		log.Fatalln("failed to load config", err)
-	}
-
-	runningSyncs := &syncStorage{
-		Data:     map[string]*Sync{},
-		Removing: map[string]struct{}{},
 	}
 
 	var level slog.Level
@@ -805,6 +743,20 @@ func main() {
 	if err != nil {
 		logger.Error("config error", slog.String("error", strings.ReplaceAll(err.Error(), "\n", " | ")))
 		os.Exit(1)
+	}
+
+	runningSyncs, err := openSyncStore(quit, config)
+	if err != nil {
+		logger.Error("sync storage", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer runningSyncs.client.Close()
+	if config.SyncWorker != "" {
+		if err := runSyncWorker(quit, logger, config, runningSyncs); err != nil {
+			logger.Error("sync worker", slog.Any("error", err))
+			os.Exit(1)
+		}
+		return
 	}
 
 	e := echo.New()
@@ -886,9 +838,7 @@ func main() {
 
 	shutdownErr := srv.Shutdown(ctx)
 
-	// Shutdown (or its deadline) prevents new handlers from completing a worker
-	// registration because the shared quit context is already cancelled.
-	runningSyncs.Workers.Wait()
+	// Workers are independent and deliberately survive web server shutdown.
 	if shutdownErr != nil {
 		logger.Error("server shutdown", slog.String("error", shutdownErr.Error()))
 		os.Exit(1)

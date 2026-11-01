@@ -82,22 +82,6 @@ func TestPathsOverlap(t *testing.T) {
 	}
 }
 
-func TestSyncStorageRemovalReservationConflicts(t *testing.T) {
-	storage := &syncStorage{
-		Data:     map[string]*Sync{},
-		Removing: map[string]struct{}{`/series/House`: {}},
-	}
-
-	storage.Lock()
-	defer storage.Unlock()
-	if !storage.hasConflictLocked("/series/House/Season 6") {
-		t.Error("child sync did not conflict with removal reservation")
-	}
-	if storage.hasConflictLocked("/series/Other") {
-		t.Error("unrelated sync conflicted with removal reservation")
-	}
-}
-
 func TestRemoteRequestContextStopsOnShutdown(t *testing.T) {
 	shutdownContext, stop := context.WithCancel(context.Background())
 	ctx, cancel := remoteRequestContext(context.Background(), shutdownContext)
@@ -123,7 +107,7 @@ func nilCommand() *exec.Cmd {
 
 func TestRsyncProgressWriterHandlesSplitTokens(t *testing.T) {
 	current := &Sync{}
-	storage := &syncStorage{Data: map[string]*Sync{}}
+	storage := &syncStorage{}
 	writer := &rsyncProgressWriter{
 		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		runningSyncs: storage,
