@@ -376,6 +376,58 @@ body {
 }
 
 @media (max-width: 650px) {
+  .sync-table,
+  .sync-table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .sync-table thead {
+    display: none;
+  }
+
+  .sync-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-top: 1px solid var(--line);
+  }
+
+  .sync-table .sync-row td {
+    min-width: 0;
+    border-top: 0;
+  }
+
+  .sync-path-cell {
+    grid-column: 1 / -1;
+  }
+
+  .sync-progress-cell {
+    grid-column: 1 / 3;
+  }
+
+  .sync-progress-cell .progress-wrap {
+    min-width: 0;
+  }
+
+  .sync-table .sync-actions-cell {
+    grid-column: 3;
+    grid-row: 2;
+    align-items: center;
+    justify-content: flex-end;
+  }
+
+  .sync-stat-cell {
+    overflow-wrap: anywhere;
+  }
+
+  .sync-stat-cell::before {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--muted);
+    font-size: 0.68rem;
+    content: attr(data-label);
+  }
+
   .desktop-dir-actions,
   .data-table th:last-child {
     display: none;

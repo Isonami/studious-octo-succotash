@@ -63,6 +63,7 @@ type dashboard struct {
 	app.Compo
 
 	dirs                   []dir
+	dirsLoadComplete       bool
 	syncs                  []syncItem
 	errors                 []string
 	currentUser            user
@@ -105,6 +106,7 @@ func NewHandler() *app.Handler {
 
 func (d *dashboard) OnMount(ctx app.Context) {
 	d.active = true
+	d.dirsLoadComplete = false
 	d.syncRefreshInFlight = false
 	d.syncRefreshDirsPending = false
 	d.requestContext, d.cancelRequests = context.WithCancel(context.Background())
@@ -221,9 +223,9 @@ func (d *dashboard) renderSyncsTable() app.UI {
 	} else {
 		for _, sync := range d.syncs {
 			current := sync
-			rows = append(rows, app.Tr().Body(
-				app.Td().Class("path-cell").Text(current.Path),
-				app.Td().Body(
+			rows = append(rows, app.Tr().Class("sync-row").Body(
+				app.Td().Class("path-cell sync-path-cell").Text(current.Path),
+				app.Td().Class("sync-progress-cell").Body(
 					app.Div().Class("progress-wrap").Body(
 						app.Div().Class("progress-track").Body(
 							app.Div().
@@ -233,10 +235,10 @@ func (d *dashboard) renderSyncsTable() app.UI {
 						app.Span().Class("progress-label").Text(fmt.Sprintf("%d%%", current.Progress)),
 					),
 				),
-				app.Td().Text(emptyDash(current.TimeLeft)),
-				app.Td().Text(formatIEC(uint64(current.Downloaded))),
-				app.Td().Text(formatIEC(uint64(current.Speed))+"/s"),
-				app.Td().Class("actions-cell").Body(
+				app.Td().Class("sync-stat-cell").Attr("data-label", "Time Left").Text(emptyDash(current.TimeLeft)),
+				app.Td().Class("sync-stat-cell").Attr("data-label", "Transferred").Text(formatIEC(uint64(current.Downloaded))),
+				app.Td().Class("sync-stat-cell").Attr("data-label", "Speed").Text(formatIEC(uint64(current.Speed))+"/s"),
+				app.Td().Class("actions-cell sync-actions-cell").Body(
 					app.Button().
 						Class("action-button danger").
 						Type("button").
@@ -250,7 +252,7 @@ func (d *dashboard) renderSyncsTable() app.UI {
 	}
 
 	return app.Div().Class("table-wrap").Body(
-		app.Table().Class("data-table").Body(
+		app.Table().Class("data-table sync-table").Body(
 			app.THead().Body(
 				app.Tr().Body(
 					app.Th().Text("Path"),
@@ -269,7 +271,11 @@ func (d *dashboard) renderSyncsTable() app.UI {
 func (d *dashboard) renderDirsTable() app.UI {
 	dirs := d.filteredDirs()
 	rows := make([]app.UI, 0, len(dirs)+1)
-	if len(dirs) == 0 {
+	if !d.dirsLoadComplete {
+		rows = append(rows, app.Tr().Body(
+			app.Td().ColSpan(3).Class("empty-state").Role("status").Text("Loading"),
+		))
+	} else if len(dirs) == 0 {
 		message := "No remote directories found."
 		if strings.TrimSpace(d.dirFilter) != "" && len(d.dirs) > 0 {
 			message = "No remote directories match this filter."
@@ -429,6 +435,7 @@ func (d *dashboard) refreshDirs(ctx app.Context) {
 	ctx.Async(func() {
 		result, err := fetchDirs(requestContext)
 		ctx.Dispatch(func(ctx app.Context) {
+			d.dirsLoadComplete = true
 			if err != nil {
 				d.handleError(err)
 				return
